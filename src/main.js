@@ -1,6 +1,4 @@
 import { Actor, log } from 'apify';
-import { PlaywrightCrawler, RequestQueue } from 'crawlee';
-import { extractSearchResults, extractBusinessData, extractReviews } from './extractor.js';
 
 await Actor.init();
 
@@ -12,155 +10,192 @@ const {
     scrapeReviews = true,
     maxReviewsPerBusiness = 10,
     language = 'en',
-    proxyConfiguration: proxyConfig,
+    googleMapsApiKey = '',
 } = input || {};
 
 if (!searchQueries.length && !directUrls.length) {
     throw new Error('No input! Please provide searchQueries or directUrls.');
 }
 
-log.info('Starting Google Maps Business Scraper...', {
+if (!googleMapsApiKey) {
+    throw new Error('Google Maps API Key required! Get one free at console.cloud.google.com');
+}
+
+log.info('Starting Google Maps Scraper (API Mode)...', {
     searchQueries: searchQueries.length,
-    directUrls: directUrls.length,
     maxResultsPerQuery,
 });
 
-const proxyConfiguration = await Actor.createProxyConfiguration(proxyConfig);
-const requestQueue = await RequestQueue.open();
+const BASE = 'https://maps.googleapis.com/maps/api';
 
-// Add search queries
+async function apiGet(url) {
+    const res = await fetch(url);
+    return res.json();
+}
+
+// Text Search → get place_ids
+async function searchPlaces(query, maxResults) {
+    const places = [];
+    let pageToken = null;
+
+    while (places.length < maxResults) {
+        let url = `${BASE}/place/textsearch/json?query=${encodeURIComponent(query)}&language=${language}&key=${googleMapsApiKey}`;
+        if (pageToken) url += `&pagetoken=${pageToken}`;
+
+        const data = await apiGet(url);
+
+        if (data.status !== 'OK' && data.status !== 'ZERO_RESULTS') {
+            log.error(`Search API error: ${data.status} — ${data.error_message || ''}`);
+            break;
+        }
+
+        for (const place of (data.results || [])) {
+            if (places.length >= maxResults) break;
+            places.push(place.place_id);
+        }
+
+        if (!data.next_page_token || places.length >= maxResults) break;
+        pageToken = data.next_page_token;
+
+        // Google requires ~2s delay before using next_page_token
+        await new Promise(r => setTimeout(r, 2000));
+    }
+
+    return places;
+}
+
+// Place Details → full business data
+async function getPlaceDetails(placeId) {
+    const fields = [
+        'place_id', 'name', 'formatted_address', 'formatted_phone_number',
+        'international_phone_number', 'website', 'rating', 'user_ratings_total',
+        'price_level', 'opening_hours', 'geometry', 'photos', 'types',
+        'business_status', 'url', 'vicinity', 'address_components',
+        'editorial_summary', 'reviews', 'plus_code', 'utc_offset',
+        'delivery', 'dine_in', 'takeout', 'reservable', 'serves_breakfast',
+        'serves_lunch', 'serves_dinner', 'serves_beer', 'serves_wine',
+        'serves_vegetarian_food', 'wheelchair_accessible_entrance',
+    ].join(',');
+
+    const url = `${BASE}/place/details/json?place_id=${placeId}&fields=${fields}&language=${language}&key=${googleMapsApiKey}`;
+    const data = await apiGet(url);
+
+    if (data.status !== 'OK') {
+        log.warning(`Details API error for ${placeId}: ${data.status}`);
+        return null;
+    }
+
+    return data.result;
+}
+
+function formatBusiness(place, sourceLabel) {
+    const addr = place.address_components || [];
+    const getAddrComponent = (type) =>
+        addr.find(c => c.types.includes(type))?.long_name || null;
+
+    // Format opening hours
+    const hours = {};
+    for (const period of (place.opening_hours?.weekday_text || [])) {
+        const [day, ...rest] = period.split(': ');
+        hours[day] = rest.join(': ');
+    }
+
+    // Format reviews
+    const reviews = (place.reviews || []).slice(0, 10).map(r => ({
+        author: r.author_name,
+        rating: r.rating,
+        date: r.relative_time_description,
+        text: r.text,
+        language: r.language,
+        profilePhoto: r.profile_photo_url,
+    }));
+
+    // Photo URLs (need API key)
+    const photos = (place.photos || []).slice(0, 10).map(p =>
+        `${BASE}/place/photo?maxwidth=800&photo_reference=${p.photo_reference}&key=${googleMapsApiKey}`
+    );
+
+    // Service options
+    const serviceOptions = [];
+    if (place.delivery) serviceOptions.push('Delivery');
+    if (place.dine_in) serviceOptions.push('Dine-in');
+    if (place.takeout) serviceOptions.push('Takeout');
+    if (place.reservable) serviceOptions.push('Reservations');
+    if (place.serves_breakfast) serviceOptions.push('Breakfast');
+    if (place.serves_lunch) serviceOptions.push('Lunch');
+    if (place.serves_dinner) serviceOptions.push('Dinner');
+    if (place.serves_beer) serviceOptions.push('Beer');
+    if (place.serves_wine) serviceOptions.push('Wine');
+    if (place.serves_vegetarian_food) serviceOptions.push('Vegetarian');
+    if (place.wheelchair_accessible_entrance) serviceOptions.push('Wheelchair accessible');
+
+    const priceLevels = { 0: 'Free', 1: '$', 2: '$$', 3: '$$$', 4: '$$$$' };
+
+    return {
+        placeId: place.place_id,
+        name: place.name,
+        category: (place.types || []).map(t => t.replace(/_/g, ' ')).slice(0, 5),
+        rating: place.rating || null,
+        reviewCount: place.user_ratings_total || null,
+        priceLevel: priceLevels[place.price_level] || null,
+        businessStatus: place.business_status || null,
+        address: place.formatted_address || null,
+        vicinity: place.vicinity || null,
+        street: getAddrComponent('route'),
+        city: getAddrComponent('locality') || getAddrComponent('administrative_area_level_2'),
+        state: getAddrComponent('administrative_area_level_1'),
+        country: getAddrComponent('country'),
+        postalCode: getAddrComponent('postal_code'),
+        phone: place.formatted_phone_number || null,
+        internationalPhone: place.international_phone_number || null,
+        website: place.website || null,
+        mapsUrl: place.url || null,
+        coordinates: place.geometry?.location || null,
+        plusCode: place.plus_code?.global_code || null,
+        hours,
+        isOpenNow: place.opening_hours?.open_now ?? null,
+        description: place.editorial_summary?.overview || null,
+        photos,
+        serviceOptions,
+        reviews,
+        sourceLabel,
+        scrapedAt: new Date().toISOString(),
+    };
+}
+
+// ── Main execution ──
+let totalSaved = 0;
+
 for (const query of searchQueries) {
-    const encoded = encodeURIComponent(query.trim());
-    await requestQueue.addRequest({
-        url: `https://www.google.com/maps/search/${encoded}/?hl=${language}`,
-        userData: { type: 'SEARCH', query: query.trim() },
-    });
+    log.info(`[SEARCH] "${query}"`);
+    const placeIds = await searchPlaces(query, maxResultsPerQuery);
+    log.info(`  Found ${placeIds.length} places`);
+
+    for (const placeId of placeIds) {
+        const place = await getPlaceDetails(placeId);
+        if (!place) continue;
+
+        const business = formatBusiness(place, `search:${query}`);
+        await Actor.pushData(business);
+        totalSaved++;
+        log.info(`  ✅ ${business.name} | ⭐ ${business.rating} | 📞 ${business.phone || 'N/A'}`);
+
+        // Small delay to respect API rate limits
+        await new Promise(r => setTimeout(r, 200));
+    }
 }
 
-// Add direct URLs
+// Direct place_id URLs
 for (const url of directUrls) {
-    await requestQueue.addRequest({
-        url: url.trim(),
-        userData: { type: 'BUSINESS', sourceLabel: `direct:${url}` },
-    });
+    const placeIdMatch = url.match(/place_id:([^&]+)/) || url.match(/!1s([^!]+)!/);
+    if (placeIdMatch) {
+        const place = await getPlaceDetails(placeIdMatch[1]);
+        if (place) {
+            await Actor.pushData(formatBusiness(place, `direct:${url}`));
+            totalSaved++;
+        }
+    }
 }
 
-const crawler = new PlaywrightCrawler({
-    requestQueue,
-    proxyConfiguration,
-    launchContext: {
-        launchOptions: {
-            headless: true,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-blink-features=AutomationControlled',
-                '--lang=en-US',
-            ],
-        },
-    },
-    browserPoolOptions: {
-        useFingerprints: true,
-    },
-    maxConcurrency: 2,
-    requestHandlerTimeoutSecs: 180,
-    maxRequestRetries: 3,
-
-    async requestHandler({ page, request }) {
-        const { type, query } = request.userData;
-
-        // Block heavy resources
-        await page.route('**/*.{mp4,mp3,woff,woff2,ttf}', (route) => route.abort());
-
-        // Accept cookies if prompted
-        try {
-            await page.click('button[aria-label*="Accept"], button[id*="accept"], #L2AGLb', { timeout: 5000 });
-            await page.waitForTimeout(1000);
-        } catch {}
-
-        // ── SEARCH page ──
-        if (type === 'SEARCH') {
-            log.info(`[SEARCH] "${query}" → ${request.url}`);
-
-            try {
-                await page.goto(request.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-            } catch (e) {
-                log.warning(`Navigation issue: ${e.message}`);
-            }
-
-            // Wait for results
-            await page.waitForSelector(
-                'a[href*="/maps/place/"], [role="feed"]',
-                { timeout: 20000 }
-            ).catch(() => log.warning('Results selector not found'));
-
-            await page.waitForTimeout(2000);
-
-            const businessUrls = await extractSearchResults(page, maxResultsPerQuery);
-            log.info(`[SEARCH] "${query}" → ${businessUrls.length} businesses found`);
-
-            for (const url of businessUrls) {
-                await requestQueue.addRequest({
-                    url,
-                    userData: {
-                        type: 'BUSINESS',
-                        sourceLabel: `search:${query}`,
-                    },
-                    uniqueKey: url.split('?')[0],
-                });
-            }
-            return;
-        }
-
-        // ── BUSINESS page ──
-        if (type === 'BUSINESS') {
-            log.info(`[BUSINESS] Processing: ${request.url}`);
-
-            try {
-                await page.goto(request.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-            } catch (e) {
-                log.warning(`Navigation issue: ${e.message}`);
-            }
-
-            await page.waitForTimeout(2500);
-
-            const business = await extractBusinessData(page, request.url);
-
-            if (!business.name) {
-                log.warning(`No business name found at ${request.url}`);
-                return;
-            }
-
-            log.info(`✅ ${business.name} | ⭐ ${business.rating} | 📞 ${business.phone || 'N/A'} | 🌐 ${business.website || 'N/A'}`);
-
-            // Scrape reviews
-            let reviews = [];
-            if (scrapeReviews && business.reviewCount > 0) {
-                try {
-                    reviews = await extractReviews(page, maxReviewsPerBusiness);
-                    log.info(`   Reviews: ${reviews.length}`);
-                } catch (e) {
-                    log.warning(`Reviews failed: ${e.message}`);
-                }
-            }
-
-            await Actor.pushData({
-                ...business,
-                reviews,
-                sourceLabel: request.userData.sourceLabel,
-            });
-        }
-    },
-
-    failedRequestHandler({ request, error }) {
-        log.error(`Failed: ${request.url} — ${error.message}`);
-    },
-});
-
-await crawler.run();
-
-const dataset = await Actor.openDataset();
-const { itemCount } = await dataset.getInfo();
-log.info(`✅ Done! Total businesses saved: ${itemCount}`);
-
+log.info(`✅ Done! Total businesses saved: ${totalSaved}`);
 await Actor.exit();
