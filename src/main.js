@@ -1,25 +1,21 @@
 /**
- * Instagram Profile & Hashtag Scraper - Apify Actor
- * Uses network request interception to capture Instagram's GraphQL API responses
+ * Instagram Profile & Hashtag Scraper v3
+ * Robust version with longer timeouts and better error handling
  */
 
 import { Actor } from 'apify';
 import { PlaywrightCrawler, Dataset, Log } from 'crawlee';
 
 const log = new Log({ prefix: 'InstagramScraper' });
-
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const randomDelay = async (min = 2000, max = 5000) => {
+const randomDelay = async (min = 2000, max = 4000) => {
     await sleep(Math.floor(Math.random() * (max - min + 1)) + min);
 };
 
-// ─── Cookie Setup ────────────────────────────────────────────────────────────
-
 async function setCookies(context, cookies) {
-    if (!cookies || cookies.length === 0) return;
+    if (!cookies?.length) return;
     const formatted = cookies.map((c) => ({
-        name: c.name,
-        value: c.value,
+        name: c.name, value: c.value,
         domain: c.domain || '.instagram.com',
         path: c.path || '/',
         secure: c.secure !== false,
@@ -27,360 +23,269 @@ async function setCookies(context, cookies) {
         sameSite: 'None'
     }));
     await context.addCookies(formatted);
-    log.info(`Set ${formatted.length} cookies successfully.`);
+    log.info(`✅ Set ${formatted.length} cookies`);
 }
 
-// ─── Dialog Dismisser ────────────────────────────────────────────────────────
-
 async function dismissDialogs(page) {
-    const selectors = [
-        'text=Not Now',
-        'text=Allow all cookies',
-        'text=Accept All',
-        'text=Only allow essential cookies'
-    ];
-    for (const sel of selectors) {
+    for (const sel of ['text=Not Now', 'text=Allow all cookies', 'text=Accept All', '[aria-label="Close"]']) {
         try {
             const el = page.locator(sel).first();
-            if (await el.isVisible({ timeout: 2000 })) {
-                await el.click();
-                await sleep(800);
-            }
+            if (await el.isVisible({ timeout: 2000 })) { await el.click(); await sleep(800); }
         } catch (_) {}
     }
 }
 
-// ─── Network Interceptor ─────────────────────────────────────────────────────
-
-function setupNetworkInterception(page, dataStore) {
-    page.on('response', async (response) => {
-        const url = response.url();
+function setupInterception(page, store) {
+    page.on('response', async (res) => {
+        const url = res.url();
+        if (!url.includes('instagram.com')) return;
         try {
-            // Intercept GraphQL API calls
-            if (url.includes('/graphql/query') || url.includes('graphql?') ||
-                url.includes('/api/v1/') || url.includes('__a=1')) {
-                const ct = response.headers()['content-type'] || '';
-                if (ct.includes('json')) {
-                    const body = await response.json().catch(() => null);
-                    if (body) dataStore.push(body);
-                }
-            }
-            // Intercept profile page JSON
-            if (url.includes('instagram.com') && url.includes('?__a=1')) {
-                const body = await response.json().catch(() => null);
-                if (body) dataStore.push(body);
+            const ct = res.headers()['content-type'] || '';
+            if (ct.includes('json') && (
+                url.includes('/graphql') || url.includes('/api/v1/') ||
+                url.includes('__a=1') || url.includes('query_hash')
+            )) {
+                const body = await res.json().catch(() => null);
+                if (body) store.push({ url, body });
             }
         } catch (_) {}
     });
 }
 
-// ─── Deep Search ─────────────────────────────────────────────────────────────
-
-function deepSearch(obj, predicate, depth = 0) {
+function deepFind(obj, test, depth = 0) {
     if (depth > 12 || !obj || typeof obj !== 'object') return null;
-    if (predicate(obj)) return obj;
-    for (const val of Object.values(obj)) {
-        const result = deepSearch(val, predicate, depth + 1);
-        if (result) return result;
+    if (test(obj)) return obj;
+    for (const v of Object.values(obj)) {
+        const r = deepFind(v, test, depth + 1);
+        if (r) return r;
     }
     return null;
 }
 
-function extractPostNode(node) {
+function parsePost(node) {
     if (!node) return null;
+    const sc = node.shortcode || node.code;
+    if (!sc) return null;
     return {
         postId: node.id,
-        shortCode: node.shortcode || node.code,
-        postUrl: `https://www.instagram.com/p/${node.shortcode || node.code}/`,
-        type: node.__typename || node.media_type,
+        shortCode: sc,
+        postUrl: `https://www.instagram.com/p/${sc}/`,
+        type: node.__typename,
         imageUrl: node.display_url || node.image_versions2?.candidates?.[0]?.url,
-        thumbnailUrl: node.thumbnail_src || node.display_url,
-        caption: node.edge_media_to_caption?.edges?.[0]?.node?.text ||
-                 node.caption?.text || '',
-        likesCount: node.edge_media_preview_like?.count ||
-                    node.edge_liked_by?.count ||
-                    node.like_count || 0,
-        commentsCount: node.edge_media_to_comment?.count ||
-                       node.comment_count || 0,
-        timestamp: node.taken_at_timestamp
-            ? new Date(node.taken_at_timestamp * 1000).toISOString()
-            : node.taken_at
-            ? new Date(node.taken_at * 1000).toISOString()
-            : null,
+        caption: node.edge_media_to_caption?.edges?.[0]?.node?.text || node.caption?.text || '',
+        likesCount: node.edge_media_preview_like?.count || node.edge_liked_by?.count || node.like_count || 0,
+        commentsCount: node.edge_media_to_comment?.count || node.comment_count || 0,
+        timestamp: node.taken_at_timestamp ? new Date(node.taken_at_timestamp * 1000).toISOString()
+                 : node.taken_at ? new Date(node.taken_at * 1000).toISOString() : null,
         isVideo: node.is_video || node.media_type === 2,
-        videoViewCount: node.video_view_count || node.play_count || 0,
-        locationName: node.location?.name || null,
-        ownerUsername: node.owner?.username || node.user?.username,
-        hashtags: (node.edge_media_to_caption?.edges?.[0]?.node?.text ||
-                   node.caption?.text || '').match(/#[\w]+/g) || [],
+        videoViews: node.video_view_count || 0,
+        location: node.location?.name || null,
+        ownerUsername: node.owner?.username || node.user?.username || null,
+        hashtags: (node.edge_media_to_caption?.edges?.[0]?.node?.text || node.caption?.text || '').match(/#[\w]+/g) || [],
     };
 }
 
-// ─── Profile Scraper ─────────────────────────────────────────────────────────
-
 async function scrapeProfile(page, username, maxPosts) {
-    log.info(`Scraping profile: @${username}`);
+    log.info(`📸 Scraping profile: @${username}`);
     const intercepted = [];
-    setupNetworkInterception(page, intercepted);
+    setupInterception(page, intercepted);
 
-    // Method 1: Load profile with ?__a=1&__d=dis for JSON response
-    const apiUrl = `https://www.instagram.com/${username}/?__a=1&__d=dis`;
-    await page.goto(apiUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await sleep(3000);
-
-    // Method 2: Try regular profile page
-    const profileUrl = `https://www.instagram.com/${username}/`;
-    await page.goto(profileUrl, { waitUntil: 'networkidle', timeout: 60000 });
-    await randomDelay(3000, 5000);
+    // Go directly to profile page
+    const url = `https://www.instagram.com/${username}/`;
+    try {
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 90000 });
+    } catch (e) {
+        log.warning(`Timeout on first load, retrying... ${e.message}`);
+        await page.goto(url, { waitUntil: 'commit', timeout: 60000 });
+    }
+    await sleep(4000);
     await dismissDialogs(page);
+    await sleep(2000);
 
-    // Extract from page scripts
-    const pageData = await page.evaluate(() => {
-        // Try window._sharedData
-        if (window._sharedData?.entry_data?.ProfilePage?.[0]?.graphql?.user) {
-            return window._sharedData.entry_data.ProfilePage[0].graphql.user;
-        }
+    // Scroll to trigger API calls
+    for (let i = 0; i < 6; i++) {
+        await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+        await sleep(2000);
+    }
 
-        // Try __additionalDataLoaded
-        const scripts = Array.from(document.querySelectorAll('script'));
+    // Get DOM post links
+    const postLinks = await page.$$eval('a[href*="/p/"]', (els) =>
+        [...new Set(els.map(e => e.href).filter(h => /\/p\/[A-Za-z0-9_-]{5,}/.test(h)))]
+    ).catch(() => []);
+    log.info(`Found ${postLinks.length} post links in DOM`);
+
+    // Parse from page scripts
+    const scriptData = await page.evaluate(() => {
+        const scripts = Array.from(document.querySelectorAll('script[type="application/json"]'));
         for (const s of scripts) {
-            const t = s.textContent || '';
-            if (t.includes('edge_owner_to_timeline_media')) {
-                try {
-                    const match = t.match(/\{.*"edge_owner_to_timeline_media".*\}/s);
-                    if (match) return JSON.parse(match[0]);
-                } catch (_) {}
-            }
-        }
-
-        // Try application/json scripts
-        const jsonScripts = Array.from(document.querySelectorAll('script[type="application/json"]'));
-        for (const s of jsonScripts) {
             try {
                 const json = JSON.parse(s.textContent);
-                const search = (obj, d = 0) => {
-                    if (d > 10 || !obj || typeof obj !== 'object') return null;
-                    if (obj.username && (obj.edge_followed_by || obj.follower_count)) return obj;
-                    if (obj.edge_owner_to_timeline_media) return obj;
-                    for (const v of Object.values(obj)) {
-                        const r = search(v, d + 1);
-                        if (r) return r;
-                    }
+                const find = (o, d = 0) => {
+                    if (d > 10 || !o || typeof o !== 'object') return null;
+                    if ((o.username && o.edge_followed_by) || o.edge_owner_to_timeline_media) return o;
+                    for (const v of Object.values(o)) { const r = find(v, d+1); if (r) return r; }
                     return null;
                 };
-                const found = search(json);
+                const found = find(json);
                 if (found) return found;
             } catch (_) {}
         }
+        return null;
+    }).catch(() => null);
 
-        // Fallback: parse meta
-        const meta = (p) => document.querySelector(`meta[property="${p}"]`)?.getAttribute('content');
-        const desc = meta('og:description') || '';
-        const m = desc.match(/([\d,.KMB]+)\s*Followers/i);
-        return {
-            username: null,
-            full_name: meta('og:title')?.replace(' • Instagram', '').trim(),
-            followers: m?.[1],
-            _fallback: true
-        };
-    });
-
-    // Scroll to load posts
-    await page.evaluate(() => window.scrollTo(0, 500));
-    await sleep(2000);
-    for (let i = 0; i < 5; i++) {
-        await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-        await sleep(2500);
-    }
-
-    // Collect all post links from DOM
-    const postLinks = await page.$$eval('a[href*="/p/"]', (els) =>
-        [...new Set(els.map((e) => e.href).filter((h) => /\/p\/[A-Za-z0-9_-]+/.test(h)))]
-    );
-
-    log.info(`Found ${postLinks.length} post links on profile page`);
-
-    // Parse user data
-    let userData = pageData;
+    let userData = scriptData;
     let posts = [];
 
-    // Extract posts from intercepted API responses
-    for (const data of intercepted) {
-        const timeline = deepSearch(data, (o) => o.edge_owner_to_timeline_media || o.edge_felix_video_timeline);
+    // Extract from intercepted network calls
+    for (const { body } of intercepted) {
+        const timeline = deepFind(body, o => o.edge_owner_to_timeline_media || o.edge_felix_video_timeline);
         if (timeline) {
-            const edges = timeline.edge_owner_to_timeline_media?.edges ||
-                          timeline.edge_felix_video_timeline?.edges || [];
-            const extracted = edges.map((e) => extractPostNode(e.node)).filter(Boolean);
-            posts.push(...extracted);
+            const edges = timeline.edge_owner_to_timeline_media?.edges || timeline.edge_felix_video_timeline?.edges || [];
+            posts.push(...edges.map(e => parsePost(e.node)).filter(Boolean));
         }
-
-        // Also search for user info
-        const user = deepSearch(data, (o) => o.username && o.edge_followed_by);
-        if (user && !userData?.username) userData = user;
+        if (!userData?.username) {
+            const user = deepFind(body, o => o.username && (o.edge_followed_by || o.follower_count));
+            if (user) userData = user;
+        }
     }
 
-    // Extract from pageData if not from interception
-    if (posts.length === 0 && userData?.edge_owner_to_timeline_media?.edges) {
-        posts = userData.edge_owner_to_timeline_media.edges
-            .map((e) => extractPostNode(e.node))
-            .filter(Boolean);
+    // Extract from script data
+    if (posts.length === 0 && scriptData?.edge_owner_to_timeline_media?.edges) {
+        posts = scriptData.edge_owner_to_timeline_media.edges.map(e => parsePost(e.node)).filter(Boolean);
     }
 
-    // Use post links as fallback
+    // Fallback to DOM links
     if (posts.length === 0 && postLinks.length > 0) {
-        log.info('Using post links as fallback...');
-        posts = postLinks.slice(0, maxPosts).map((url) => {
-            const match = url.match(/\/p\/([A-Za-z0-9_-]+)/);
-            return match ? { shortCode: match[1], postUrl: url } : null;
+        log.info('Using DOM post links as fallback');
+        posts = postLinks.slice(0, maxPosts).map(u => {
+            const m = u.match(/\/p\/([A-Za-z0-9_-]+)/);
+            return m ? { shortCode: m[1], postUrl: u } : null;
         }).filter(Boolean);
     }
 
-    const followers = userData?.edge_followed_by?.count ||
-                      userData?.follower_count ||
-                      userData?.followers;
+    // Deduplicate
+    const seen = new Set();
+    posts = posts.filter(p => { if (!p.shortCode || seen.has(p.shortCode)) return false; seen.add(p.shortCode); return true; });
 
-    log.info(`@${username} | Followers: ${followers} | Posts extracted: ${posts.length}`);
+    const followers = userData?.edge_followed_by?.count || userData?.follower_count;
+    log.info(`@${username} | Followers: ${followers} | Posts: ${posts.length}`);
 
     return {
         type: 'profile',
         scrapedAt: new Date().toISOString(),
-        profileUrl: `https://www.instagram.com/${username}/`,
+        profileUrl: url,
         username: userData?.username || username,
         fullName: userData?.full_name,
         biography: userData?.biography,
-        followers: followers,
+        followers,
         following: userData?.edge_follow?.count || userData?.following_count,
         postsCount: userData?.edge_owner_to_timeline_media?.count || userData?.media_count,
         isVerified: userData?.is_verified || false,
         isPrivate: userData?.is_private || false,
         profilePicUrl: userData?.profile_pic_url_hd || userData?.profile_pic_url,
         externalUrl: userData?.external_url,
-        isBusiness: userData?.is_business_account || false,
         posts: posts.slice(0, maxPosts)
     };
 }
 
-// ─── Hashtag Scraper ─────────────────────────────────────────────────────────
-
 async function scrapeHashtag(page, hashtag, maxPosts) {
-    log.info(`Scraping hashtag: #${hashtag}`);
+    log.info(`#️⃣  Scraping hashtag: #${hashtag}`);
     const intercepted = [];
-    setupNetworkInterception(page, intercepted);
+    setupInterception(page, intercepted);
 
-    const hashtagUrl = `https://www.instagram.com/explore/tags/${encodeURIComponent(hashtag)}/`;
-    await page.goto(hashtagUrl, { waitUntil: 'networkidle', timeout: 60000 });
-    await randomDelay(3000, 5000);
+    const url = `https://www.instagram.com/explore/tags/${encodeURIComponent(hashtag)}/`;
+    try {
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 90000 });
+    } catch (e) {
+        log.warning(`Timeout, retrying... ${e.message}`);
+        await page.goto(url, { waitUntil: 'commit', timeout: 60000 });
+    }
+    await sleep(4000);
     await dismissDialogs(page);
 
-    // Scroll to load more
+    // Scroll multiple times
     for (let i = 0; i < 8; i++) {
         await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-        await sleep(2500);
+        await sleep(2000);
     }
 
-    // Extract from page
-    const pageData = await page.evaluate(() => {
-        const jsonScripts = Array.from(document.querySelectorAll('script[type="application/json"]'));
-        for (const s of jsonScripts) {
+    // Extract from page scripts
+    const scriptData = await page.evaluate(() => {
+        const scripts = Array.from(document.querySelectorAll('script[type="application/json"]'));
+        for (const s of scripts) {
             try {
                 const json = JSON.parse(s.textContent);
-                const search = (obj, d = 0) => {
-                    if (d > 10 || !obj || typeof obj !== 'object') return null;
-                    if (obj.name && obj.edge_hashtag_to_media) return obj;
-                    if (obj.hashtag && (obj.hashtag.edge_hashtag_to_media || obj.hashtag.media)) return obj.hashtag;
-                    for (const v of Object.values(obj)) {
-                        const r = search(v, d + 1);
-                        if (r) return r;
-                    }
+                const find = (o, d = 0) => {
+                    if (d > 10 || !o || typeof o !== 'object') return null;
+                    if (o.edge_hashtag_to_media || (o.hashtag && o.hashtag.edge_hashtag_to_media)) return o.hashtag || o;
+                    for (const v of Object.values(o)) { const r = find(v, d+1); if (r) return r; }
                     return null;
                 };
-                const found = search(json);
+                const found = find(json);
                 if (found) return found;
             } catch (_) {}
         }
         return null;
-    });
+    }).catch(() => null);
 
     let posts = [];
     let totalCount = null;
 
-    // Extract from intercepted responses
-    for (const data of intercepted) {
-        const hashData = deepSearch(data, (o) =>
-            (o.name || o.hashtag) && (o.edge_hashtag_to_media || o.media)
-        );
-        if (hashData) {
-            const edges = hashData.edge_hashtag_to_media?.edges ||
-                          hashData.edge_hashtag_to_top_posts?.edges || [];
-            const extracted = edges.map((e) => ({
-                ...extractPostNode(e.node),
-                hashtag
-            })).filter(Boolean);
-            posts.push(...extracted);
-            if (!totalCount) totalCount = hashData.edge_hashtag_to_media?.count;
+    // From intercepted
+    for (const { body } of intercepted) {
+        const hd = deepFind(body, o => o.edge_hashtag_to_media || (o.name && o.edge_hashtag_to_top_posts));
+        if (hd) {
+            const edges = [...(hd.edge_hashtag_to_top_posts?.edges || []), ...(hd.edge_hashtag_to_media?.edges || [])];
+            posts.push(...edges.map(e => ({ ...parsePost(e.node), hashtag })).filter(p => p?.shortCode));
+            if (!totalCount) totalCount = hd.edge_hashtag_to_media?.count;
         }
     }
 
-    // Extract from pageData
-    if (posts.length === 0 && pageData) {
-        const edges = [
-            ...(pageData.edge_hashtag_to_top_posts?.edges || []),
-            ...(pageData.edge_hashtag_to_media?.edges || [])
-        ];
-        posts = edges.map((e) => ({ ...extractPostNode(e.node), hashtag })).filter(Boolean);
-        totalCount = pageData.edge_hashtag_to_media?.count;
+    // From scripts
+    if (posts.length === 0 && scriptData) {
+        const edges = [...(scriptData.edge_hashtag_to_top_posts?.edges || []), ...(scriptData.edge_hashtag_to_media?.edges || [])];
+        posts = edges.map(e => ({ ...parsePost(e.node), hashtag })).filter(p => p?.shortCode);
+        totalCount = scriptData.edge_hashtag_to_media?.count;
     }
 
-    // Fallback: get post links from DOM
+    // DOM fallback
     if (posts.length === 0) {
-        const links = await page.$$eval('a[href*="/p/"]', (els) =>
-            [...new Set(els.map((e) => e.href).filter((h) => /\/p\/[A-Za-z0-9_-]+/.test(h)))]
-        );
-        posts = links.slice(0, maxPosts).map((url) => {
-            const m = url.match(/\/p\/([A-Za-z0-9_-]+)/);
-            return m ? { shortCode: m[1], postUrl: url, hashtag } : null;
+        const links = await page.$$eval('a[href*="/p/"]', els =>
+            [...new Set(els.map(e => e.href).filter(h => /\/p\/[A-Za-z0-9_-]{5,}/.test(h)))]
+        ).catch(() => []);
+        posts = links.slice(0, maxPosts).map(u => {
+            const m = u.match(/\/p\/([A-Za-z0-9_-]+)/);
+            return m ? { shortCode: m[1], postUrl: u, hashtag } : null;
         }).filter(Boolean);
+        log.info(`DOM fallback: found ${posts.length} post links`);
     }
 
-    // Remove duplicates
+    // Deduplicate
     const seen = new Set();
-    posts = posts.filter((p) => {
-        const key = p.shortCode || p.postUrl;
-        if (!key || seen.has(key)) return false;
-        seen.add(key);
-        return true;
-    });
+    posts = posts.filter(p => { if (!p.shortCode || seen.has(p.shortCode)) return false; seen.add(p.shortCode); return true; });
 
-    log.info(`Hashtag #${hashtag} | Total: ${totalCount} | Scraped: ${posts.length}`);
+    log.info(`#${hashtag} | Total: ${totalCount} | Scraped: ${posts.length}`);
 
     return {
         type: 'hashtag',
         scrapedAt: new Date().toISOString(),
-        hashtag,
-        hashtagUrl,
-        totalPostsCount: totalCount,
+        hashtag, hashtagUrl: url, totalPostsCount: totalCount,
         posts: posts.slice(0, maxPosts)
     };
 }
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
+// ─── Main ────────────────────────────────────────────────────────────────────
 
 await Actor.init();
-
 const input = await Actor.getInput() || {};
 const {
-    scrapeType = 'both',
-    usernames = [],
-    hashtags = [],
-    maxPostsPerProfile = 12,
-    maxPostsPerHashtag = 20,
-    scrapeComments = false,
+    scrapeType = 'both', usernames = [], hashtags = [],
+    maxPostsPerProfile = 12, maxPostsPerHashtag = 20,
     proxy = { useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'] },
     loginCookies = []
 } = input;
 
-log.info('Config:', { scrapeType, usernames, hashtags, maxPostsPerProfile, maxPostsPerHashtag });
-
+log.info('Config:', { scrapeType, usernames, hashtags });
 const proxyConfig = await Actor.createProxyConfiguration(proxy);
 
 const crawler = new PlaywrightCrawler({
@@ -388,83 +293,59 @@ const crawler = new PlaywrightCrawler({
     launchContext: {
         launchOptions: {
             headless: true,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-blink-features=AutomationControlled',
-                '--disable-web-security',
-                '--lang=en-US'
-            ]
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+                   '--disable-blink-features=AutomationControlled', '--lang=en-US',
+                   '--disable-features=IsolateOrigins,site-per-process']
         }
     },
     browserPoolOptions: { useFingerprints: true },
     maxConcurrency: 1,
-    requestHandlerTimeoutSecs: 360,
-    maxRequestRetries: 2,
+    navigationTimeoutSecs: 120,
+    requestHandlerTimeoutSecs: 420,
+    maxRequestRetries: 3,
 
     async requestHandler({ page, request }) {
         const { type, identifier } = request.userData;
-
         await page.setViewportSize({ width: 1366, height: 768 });
-        await page.setExtraHTTPHeaders({
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-        });
+        await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
 
-        // Set cookies on browser context
         if (loginCookies.length > 0) {
             await setCookies(page.context(), loginCookies);
         }
 
         try {
-            let result;
-            if (type === 'profile') {
-                result = await scrapeProfile(page, identifier, maxPostsPerProfile);
-            } else {
-                result = await scrapeHashtag(page, identifier, maxPostsPerHashtag);
-            }
+            const result = type === 'profile'
+                ? await scrapeProfile(page, identifier, maxPostsPerProfile)
+                : await scrapeHashtag(page, identifier, maxPostsPerHashtag);
             await Dataset.pushData(result);
-            log.info(`✅ ${type} "${identifier}" saved | Posts: ${result.posts?.length}`);
+            log.info(`✅ Saved ${type} "${identifier}" | Posts: ${result.posts?.length}`);
         } catch (err) {
-            log.error(`Failed ${type} "${identifier}": ${err.message}`);
+            log.error(`❌ Failed ${type} "${identifier}": ${err.message}`);
             await Dataset.pushData({ type, identifier, error: err.message, scrapedAt: new Date().toISOString() });
         }
     },
 
     failedRequestHandler({ request, error }) {
-        log.error(`Request failed: ${request.url} — ${error.message}`);
+        log.error(`Failed: ${request.url} — ${error.message}`);
     }
 });
 
 const requests = [];
-
 if (scrapeType === 'profile' || scrapeType === 'both') {
     for (const u of usernames) {
         const clean = u.replace(/^@/, '').trim();
-        if (clean) requests.push({
-            url: `https://www.instagram.com/${clean}/`,
-            userData: { type: 'profile', identifier: clean }
-        });
+        if (clean) requests.push({ url: `https://www.instagram.com/${clean}/`, userData: { type: 'profile', identifier: clean } });
     }
 }
-
 if (scrapeType === 'hashtag' || scrapeType === 'both') {
     for (const t of hashtags) {
         const clean = t.replace(/^#/, '').trim();
-        if (clean) requests.push({
-            url: `https://www.instagram.com/explore/tags/${encodeURIComponent(clean)}/`,
-            userData: { type: 'hashtag', identifier: clean }
-        });
+        if (clean) requests.push({ url: `https://www.instagram.com/explore/tags/${encodeURIComponent(clean)}/`, userData: { type: 'hashtag', identifier: clean } });
     }
 }
 
-if (requests.length === 0) {
-    log.warning('No usernames or hashtags provided!');
-    await Actor.exit();
-}
-
+if (!requests.length) { log.warning('No targets!'); await Actor.exit(); }
 log.info(`Starting ${requests.length} target(s)...`);
 await crawler.run(requests);
-log.info('🎉 Done! Check Dataset for results.');
+log.info('🎉 Done!');
 await Actor.exit();
