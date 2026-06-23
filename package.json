@@ -1,14 +1,21 @@
 {
-  "name": "youtube-scraper",
+  "name": "instagram-profile-hashtag-scraper",
   "version": "1.0.0",
-  "type": "module",
+  "description": "Apify Actor to scrape Instagram profiles and hashtags",
   "main": "src/main.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/main.js",
+    "test": "node src/main.js"
+  },
   "dependencies": {
-    "apify": "^3.2.2",
+    "apify": "^3.1.10",
     "crawlee": "^3.5.8",
     "playwright": "^1.40.0"
   },
   "engines": {
     "node": ">=18.0.0"
-  }
+  },
+  "author": "Your Name",
+  "license": "ISC"
 }

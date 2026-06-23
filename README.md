@@ -1,71 +1,157 @@
-# YouTube Channel & Video Scraper
+# Instagram Profile & Hashtag Scraper
 
-Scrape YouTube videos, channels, and search results — **no API key required**. Extracts data directly from YouTube's internal data structure.
+An Apify Actor that scrapes **Instagram profiles** and **hashtag posts** without requiring the official API.
+
+---
 
 ## Features
 
-- **Search results** — find videos by keyword
-- **Channel scraping** — all videos, subscribers, description, banner
-- **Video details** — views, likes, duration, tags, chapters, related videos
-- **Comments** — top comments with author, likes, date
-- **No API limits** — works without YouTube Data API
+- **Profile Scraper**: Extracts username, full name, bio, followers, following, post count, verification status, and individual post data
+- **Hashtag Scraper**: Extracts top posts and recent posts for any hashtag with likes, captions, timestamps, and more
+- **Post Details**: Image URL, caption, likes, comments count, timestamp, location, hashtags, mentions
+- **Optional Comments**: Scrape comments on each post (configurable limit)
+- **Anti-detection**: Random delays, fingerprint spoofing, proxy support
+- **Proxy Support**: Works with Apify Residential Proxies (recommended) or your own proxies
+- **Session Cookies**: Optionally provide login cookies for better access
 
-## Input
+---
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `searchQueries` | array | YouTube search keywords |
-| `channelUrls` | array | YouTube channel URLs |
-| `videoUrls` | array | Direct video URLs |
-| `maxVideosPerChannel` | number | Max videos per channel (default: 30) |
-| `maxResultsPerSearch` | number | Max results per search (default: 20) |
-| `scrapeComments` | boolean | Extract comments (default: false) |
-| `maxCommentsPerVideo` | number | Max comments per video (default: 20) |
-| `scrapeChannel` | boolean | Extract channel info (default: true) |
+## Input Configuration
 
-## Output — Video
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `scrapeType` | string | `"both"` | `"profile"`, `"hashtag"`, or `"both"` |
+| `usernames` | array | `[]` | Instagram usernames (without @) |
+| `hashtags` | array | `[]` | Hashtags to scrape (without #) |
+| `maxPostsPerProfile` | integer | `12` | Max posts per profile (1–200) |
+| `maxPostsPerHashtag` | integer | `20` | Max posts per hashtag (1–500) |
+| `scrapeComments` | boolean | `false` | Whether to scrape post comments |
+| `maxCommentsPerPost` | integer | `10` | Max comments per post |
+| `proxy` | object | Apify Residential | Proxy configuration |
+| `loginCookies` | array | `[]` | Optional Instagram session cookies |
 
-```json
-{
-  "type": "video",
-  "videoId": "dQw4w9WgXcQ",
-  "title": "Rick Astley - Never Gonna Give You Up",
-  "channelName": "Rick Astley",
-  "views": 1400000000,
-  "likes": "1.5M",
-  "duration": "3:33",
-  "durationSeconds": 213,
-  "publishedAt": "2009-10-25",
-  "tags": ["rick astley", "never gonna give you up"],
-  "chapters": [],
-  "thumbnail": "https://i.ytimg.com/vi/...",
-  "description": "...",
-  "relatedVideos": [{ "title": "...", "views": "..." }],
-  "comments": [{ "author": "...", "text": "...", "likes": "2.3K" }],
-  "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-}
-```
+---
 
-## Output — Channel
+## Example Input
 
 ```json
 {
-  "type": "channel",
-  "channelId": "UCuAXFkgsw1L7xaCfnd5JJOw",
-  "name": "Rick Astley",
-  "handle": "@RickAstley",
-  "subscriberCount": "3.8M subscribers",
-  "videoCount": "82 videos",
-  "description": "...",
-  "avatar": "https://...",
-  "banner": "https://..."
+  "scrapeType": "both",
+  "usernames": ["natgeo", "nasa"],
+  "hashtags": ["travel", "photography"],
+  "maxPostsPerProfile": 20,
+  "maxPostsPerHashtag": 30,
+  "scrapeComments": false,
+  "proxy": {
+    "useApifyProxy": true,
+    "apifyProxyGroups": ["RESIDENTIAL"]
+  }
 }
 ```
 
-## Use cases
+---
 
-- Content research & competitor analysis
-- Influencer marketing — find channels by niche
-- Trend tracking by keyword
-- Video performance benchmarking
-- Comment sentiment analysis
+## Output Data Format
+
+### Profile Result
+
+```json
+{
+  "type": "profile",
+  "scrapedAt": "2024-01-15T10:30:00.000Z",
+  "username": "natgeo",
+  "fullName": "National Geographic",
+  "biography": "The official Instagram of National Geographic...",
+  "followers": 280500000,
+  "following": 152,
+  "postsCount": 30800,
+  "isVerified": true,
+  "isPrivate": false,
+  "profilePicUrl": "https://...",
+  "externalUrl": "https://www.nationalgeographic.com",
+  "isBusiness": true,
+  "posts": [
+    {
+      "postId": "123456",
+      "shortCode": "ABC123",
+      "postUrl": "https://www.instagram.com/p/ABC123/",
+      "type": "GraphImage",
+      "imageUrl": "https://...",
+      "caption": "Amazing photo caption #nature",
+      "likesCount": 150000,
+      "commentsCount": 1200,
+      "timestamp": "2024-01-14T12:00:00.000Z",
+      "isVideo": false,
+      "locationName": "Yellowstone National Park",
+      "hashtags": ["#nature", "#wildlife"],
+      "mentions": []
+    }
+  ]
+}
+```
+
+### Hashtag Result
+
+```json
+{
+  "type": "hashtag",
+  "scrapedAt": "2024-01-15T10:30:00.000Z",
+  "hashtag": "travel",
+  "hashtagUrl": "https://www.instagram.com/explore/tags/travel/",
+  "totalPostsCount": 650000000,
+  "posts": [
+    {
+      "postId": "789012",
+      "shortCode": "XYZ789",
+      "postUrl": "https://www.instagram.com/p/XYZ789/",
+      "hashtag": "travel",
+      "imageUrl": "https://...",
+      "caption": "Beautiful destination! #travel #adventure",
+      "likesCount": 5200,
+      "commentsCount": 89,
+      "timestamp": "2024-01-15T08:00:00.000Z",
+      "ownerUsername": "someuser",
+      "isVideo": false
+    }
+  ]
+}
+```
+
+---
+
+## Setup on Apify
+
+1. Go to [Apify Console](https://console.apify.com) → **Actors** → **Create new**
+2. Upload all files from this folder
+3. Set the Dockerfile as the build source
+4. Configure your input in the **Input** tab
+5. Click **Run**
+
+## Getting Instagram Cookies (Optional but Recommended)
+
+For better scraping results, provide your Instagram session cookies:
+
+1. Log into Instagram in your browser
+2. Open DevTools → Application → Cookies → `instagram.com`
+3. Copy cookies (especially `sessionid`, `csrftoken`, `ds_user_id`)
+4. Paste them as an array in the `loginCookies` input field
+
+---
+
+## Important Notes
+
+- **Rate Limiting**: Instagram aggressively rate-limits scrapers. Use residential proxies and keep delays between requests.
+- **Private Profiles**: Private profiles cannot be scraped without being a follower.
+- **Terms of Service**: Scraping Instagram may violate their ToS. Use responsibly and for personal/research purposes only.
+- **Proxy**: Using Apify Residential Proxies (`RESIDENTIAL` group) is strongly recommended to avoid blocks.
+
+---
+
+## Troubleshooting
+
+| Issue | Solution |
+|---|---|
+| Empty results | Add session cookies or use residential proxy |
+| Rate limit errors | Increase delays, reduce concurrency |
+| Private profile | Must follow the account first |
+| Login wall | Provide `loginCookies` in input |
